@@ -2,7 +2,6 @@ import os
 import re
 import json
 import time
-import shutil
 import tempfile
 import logging
 import subprocess
@@ -11,46 +10,41 @@ from typing import Optional, Tuple
 import requests
 from flask import Flask, request, jsonify
 import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import ClientError
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config (env vars)
+# Environment / Config
 # ──────────────────────────────────────────────────────────────────────────────
 PORT                = int(os.getenv("PORT", "10000"))
-
 AWS_REGION          = os.getenv("AWS_REGION", "us-east-2")
-S3_BUCKET           = os.getenv("S3_BUCKET", "")                     # e.g. sumxp-renders
-OUTPUT_PREFIX       = os.getenv("OUTPUT_PREFIX", "renders/")         # e.g. renders/
-OVERLAY_S3_KEY      = os.getenv("OVERLAY_S3_KEY", "").strip()        # e.g. hand_overlay.mov
+S3_BUCKET           = os.getenv("S3_BUCKET", "")
+OUTPUT_PREFIX       = os.getenv("OUTPUT_PREFIX", "renders/")
+OVERLAY_S3_KEY      = os.getenv("OVERLAY_S3_KEY", "").strip()
 MAKE_PUBLIC         = os.getenv("MAKE_PUBLIC", "false").lower() == "true"
-PRESIGN_TTL         = int(os.getenv("PRESIGN_TTL", "43200"))         # seconds; 0=off
-
-# Render settings (kept simple and robust for booth media)
+PRESIGN_TTL         = int(os.getenv("PRESIGN_TTL", "43200"))
 TARGET_FPS          = int(os.getenv("TARGET_FPS", "20"))
 FFMPEG_BIN          = os.getenv("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN         = os.getenv("FFPROBE_BIN", "ffprobe")
 
-# Optional: post the processed URL back to Breeze (Manual Uploads)
+# Optional Breeze post-back (Manual Uploads)
 POST_BACK_TO_BREEZE = os.getenv("POST_BACK_TO_BREEZE", "false").lower() == "true"
-BREEZE_UPLOAD_URL   = os.getenv("BREEZE_UPLOAD_URL", "").strip()     # your Breeze API "upload by URL" endpoint
-BREEZE_API_KEY      = os.getenv("BREEZE_API_KEY", "").strip()        # Bearer token / API key
+BREEZE_UPLOAD_URL   = os.getenv("BREEZE_UPLOAD_URL", "").strip()
+BREEZE_API_KEY      = os.getenv("BREEZE_API_KEY", "").strip()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# App & AWS clients
+# App + AWS
 # ──────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
-_session = boto3.session.Session(region_name=AWS_REGION)
-_s3 = _session.client("s3")
+session = boto3.session.Session(region_name=AWS_REGION)
+s3 = session.client("s3")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Utilities
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _run(cmd: list[str]) -> Tuple[int, str]:
-    """Run a shell command and capture combined output."""
     app.logger.info("FFmpeg cmd: %s", " ".join(cmd))
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     out = []
@@ -60,7 +54,6 @@ def _run(cmd: list[str]) -> Tuple[int, str]:
     return code, "".join(out)
 
 def _download(url: str, dst_path: str):
-    """HTTP download to file."""
     app.logger.info("⬇️  downloading %s", url)
     with requests.get(url, stream=True, timeout=30) as r:
         r.raise_for_status()
@@ -71,20 +64,20 @@ def _download(url: str, dst_path: str):
 
 def s3_download(bucket: str, key: str, dst_path: str):
     app.logger.info("Downloading overlay from s3://%s/%s", bucket, key)
-    _s3.download_file(bucket, key, dst_path)
+    s3.download_file(bucket, key, dst_path)
 
 def s3_upload(src_path: str, bucket: str, key: str) -> str:
-    """Upload to S3. Return s3:// URL; also return https if public or presigned if configured."""
     extra = {}
     if MAKE_PUBLIC:
         extra["ACL"] = "public-read"
-    app.logger.info("⬆️  uploading to s3://%s/%s (%0.2f MB)", bucket, key, os.path.getsize(src_path)/1e6)
-    _s3.upload_file(src_path, bucket, key, ExtraArgs=extra)
-    # Choose best URL to give back
+    size = os.path.getsize(src_path)/1e6
+    app.logger.info("⬆️  uploading to s3://%s/%s (%.2f MB)", bucket, key, size)
+    s3.upload_file(src_path, bucket, key, ExtraArgs=extra)
+
     if MAKE_PUBLIC:
         return f"https://{bucket}.s3.{AWS_REGION}.amazonaws.com/{key}"
     if PRESIGN_TTL > 0:
-        return _s3.generate_presigned_url(
+        return s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=PRESIGN_TTL
@@ -92,11 +85,9 @@ def s3_upload(src_path: str, bucket: str, key: str) -> str:
     return f"s3://{bucket}/{key}"
 
 def ffprobe_meta(path: str) -> dict:
-    """Get basic meta (width/height/fps)."""
     try:
         cmd = [
-            FFPBROBE_BIN := FFPROBE_BIN, "-v", "error",
-            "-select_streams", "v:0",
+            FFPROBE_BIN, "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=width,height,avg_frame_rate",
             "-of", "json", path
         ]
@@ -107,7 +98,7 @@ def ffprobe_meta(path: str) -> dict:
             fps = st.get("avg_frame_rate", "0/1")
             try:
                 n, d = fps.split("/")
-                fps_val = round(float(n) / float(d), 3) if float(d) != 0 else TARGET_FPS
+                fps_val = round(float(n)/float(d), 3) if float(d) != 0 else TARGET_FPS
             except Exception:
                 fps_val = TARGET_FPS
             return {"width": st.get("width"), "height": st.get("height"), "fps": fps_val}
@@ -118,17 +109,40 @@ def ffprobe_meta(path: str) -> dict:
 MP4_RE = re.compile(r'https?://[^"\']+\.mp4[^"\']*', re.I)
 
 def resolve_mp4_from_page(url: str) -> Optional[str]:
-    """Fetch a page and pull the first .mp4 URL."""
+    """Fetch HTML and locate an .mp4; retry without /location if needed."""
     app.logger.info("🔎 resolving MP4 from page: %s", url)
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    m = MP4_RE.search(r.text)
-    if m:
-        return m.group(0)
+    try:
+        r = requests.get(url, timeout=25)
+        r.raise_for_status()
+        html = r.text
+        candidates = MP4_RE.findall(html)
+        candidates += re.findall(r'src=["\'](https?://[^"\']+\.mp4[^"\']*)', html, re.I)
+        candidates += re.findall(r'property=["\']og:video["\']\s+content=["\'](https?://[^"\']+\.mp4[^"\']*)', html, re.I)
+        candidates += re.findall(r'"(https?://[^"]+\.mp4[^"]*)"', html, re.I)
+        if candidates:
+            return candidates[0]
+
+        # fallback: try without /location
+        if url.rstrip("/").endswith("/location"):
+            alt = url.rstrip("/")[:-len("/location")]
+            app.logger.info("🔁 retrying without /location: %s", alt)
+            r2 = requests.get(alt, timeout=25)
+            r2.raise_for_status()
+            html2 = r2.text
+            c2 = (
+                MP4_RE.findall(html2)
+                + re.findall(r'src=["\'](https?://[^"\']+\.mp4[^"\']*)', html2, re.I)
+                + re.findall(r'property=["\']og:video["\']\s+content=["\'](https?://[^"\']+\.mp4[^"\']*)', html2, re.I)
+                + re.findall(r'"(https?://[^"]+\.mp4[^"]*)"', html2, re.I)
+            )
+            if c2:
+                return c2[0]
+
+    except Exception as e:
+        app.logger.warning("Resolver error: %s", e)
     return None
 
 def extract_uid(payload: dict) -> str:
-    # Try explicit id, else session id, else timestamp
     return (
         payload.get("id")
         or payload.get("eventkitesessionid")
@@ -136,7 +150,6 @@ def extract_uid(payload: dict) -> str:
     )
 
 def maybe_download_overlay(workdir: str) -> Optional[str]:
-    """Return local path to overlay or None."""
     if not OVERLAY_S3_KEY:
         app.logger.info("No OVERLAY_S3_KEY set; skipping overlay.")
         return None
@@ -148,19 +161,14 @@ def maybe_download_overlay(workdir: str) -> Optional[str]:
         app.logger.warning("Overlay download failed: %s", e)
         return None
 
-def compose_with_ffmpeg(src_mp4: str, out_mp4: str, overlay: Optional[str]) -> None:
-    """
-    Composite overlay (if present) and re-encode to event-safe H.264 + faststart + 20fps.
-    We keep sizing as-is (no forced scaling) to avoid soft blur; both streams should be 960x1440.
-    """
+def compose_with_ffmpeg(src_mp4: str, out_mp4: str, overlay: Optional[str]):
     if overlay:
-        # Use alpha if present; overlay fully covers; shortest=1 to account for any duration mismatch
         filtergraph = "[0:v]format=rgba[base];[1:v]format=rgba[ol];[base][ol]overlay=0:0:format=auto:shortest=1[vout]"
         cmd = [
             FFMPEG_BIN, "-y", "-loglevel", "error",
             "-i", src_mp4, "-i", overlay,
             "-filter_complex", filtergraph,
-            "-map", "[vout]", "-map", "0:a?",               # keep audio if exists
+            "-map", "[vout]", "-map", "0:a?",
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-r", str(TARGET_FPS),
             "-movflags", "+faststart",
@@ -182,13 +190,8 @@ def compose_with_ffmpeg(src_mp4: str, out_mp4: str, overlay: Optional[str]) -> N
         raise RuntimeError(f"ffmpeg failed (code {code})\n{out}")
 
 def post_back_to_breeze(processed_url: str, payload: dict) -> dict:
-    """
-    Push the processed URL to Breeze as a 'Manual Upload' so the Microsite shows it.
-    Adjust the payload keys to match your Breeze endpoint if needed.
-    """
     if not (POST_BACK_TO_BREEZE and BREEZE_UPLOAD_URL and BREEZE_API_KEY):
         return {"status": "skipped"}
-
     headers = {
         "Authorization": f"Bearer {BREEZE_API_KEY}",
         "Content-Type": "application/json",
@@ -198,8 +201,7 @@ def post_back_to_breeze(processed_url: str, payload: dict) -> dict:
         "gallery_id": payload.get("eventkitegalleryid"),
         "session_id": payload.get("eventkitesessionid"),
         "url": processed_url,
-        "media_type": "video/mp4",
-        # "replace_existing": True,  # enable if your endpoint supports replacing the visible video
+        "media_type": "video/mp4"
     }
     try:
         r = requests.post(BREEZE_UPLOAD_URL, headers=headers, json=body, timeout=20)
@@ -213,22 +215,16 @@ def post_back_to_breeze(processed_url: str, payload: dict) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 # Routes
 # ──────────────────────────────────────────────────────────────────────────────
-
 @app.get("/health")
-def health():
-    return "ok"
+def health(): return "ok"
 
 @app.get("/")
-def root():
-    return "renderer ready"
+def root(): return "renderer ready"
 
 @app.get("/warmup")
 def warmup():
-    # Quick, non-failing probes
-    try:
-        _s3.list_buckets()
-    except Exception:
-        pass
+    try: s3.list_buckets()
+    except Exception: pass
     return jsonify({"status": "ok"})
 
 @app.post("/webhook")
@@ -237,26 +233,18 @@ def webhook():
     raw = request.get_data(as_text=True)[:1500]
     app.logger.info("Webhook received raw (first 1500 chars): %s", raw)
     try:
-        payload = request.get_json(force=True, silent=False)
+        payload = request.get_json(force=True)
     except Exception:
         payload = {}
 
     uid = extract_uid(payload)
-
-    # Determine source MP4:
     mp4_url = None
 
-    # If Breeze sends us a direct MP4 URL (custom webhook), accept it
-    if isinstance(payload.get("mp4_url"), str) and payload["mp4_url"].lower().endswith(".mp4"):
+    if isinstance(payload.get("mp4_url"), str) and ".mp4" in payload["mp4_url"]:
         mp4_url = payload["mp4_url"]
         app.logger.info("🎬 MP4 detected: %s", mp4_url)
-
-    # If Breeze sends "media_url" and it's a microsite/page, resolve to MP4
     if not mp4_url and isinstance(payload.get("media_url"), str):
-        page = payload["media_url"]
-        mp4_url = resolve_mp4_from_page(page)
-
-    # If Breeze sends 'image_url' (often a microsite path), try that too
+        mp4_url = resolve_mp4_from_page(payload["media_url"])
     if not mp4_url and isinstance(payload.get("image_url"), str):
         mp4_url = resolve_mp4_from_page(payload["image_url"])
 
@@ -264,30 +252,17 @@ def webhook():
         app.logger.warning("⚠️ No MP4 found; keys=%s", list(payload.keys()))
         return jsonify({"status": "ignored", "reason": "no_mp4"}), 200
 
-    # Work in temp dir
     with tempfile.TemporaryDirectory() as tmp:
-        src_path = os.path.join(tmp, "source.mp4")
-        out_path = os.path.join(tmp, f"{uid}_final.mp4")
-
-        # Download source
-        _download(mp4_url, src_path)
-
-        # Optional overlay
-        overlay_local = maybe_download_overlay(tmp)
-
-        # Compose
-        compose_with_ffmpeg(src_path, out_path, overlay_local)
-
-        # Upload to S3
+        src = os.path.join(tmp, "source.mp4")
+        out = os.path.join(tmp, f"{uid}_final.mp4")
+        _download(mp4_url, src)
+        overlay = maybe_download_overlay(tmp)
+        compose_with_ffmpeg(src, out, overlay)
         key = f"{OUTPUT_PREFIX.rstrip('/')}/{uid}_final.mp4"
-        processed_url = s3_upload(out_path, S3_BUCKET, key)
+        processed_url = s3_upload(out, S3_BUCKET, key)
+        meta = ffprobe_meta(out)
 
-        # Probe some meta (non-fatal)
-        meta = ffprobe_meta(out_path)
-
-    # Optional: send back to Breeze (Manual Uploads)
     breeze = post_back_to_breeze(processed_url, payload) if POST_BACK_TO_BREEZE else {"status": "skipped"}
-
     took = round(time.time() - started, 2)
     app.logger.info("✅ done uid=%s time=%0.2fs meta=%s", uid, took, meta)
     return jsonify({
