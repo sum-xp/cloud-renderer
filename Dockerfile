@@ -8,13 +8,12 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# bundle your overlay for reliability
-COPY assets ./assets
-ENV LOCAL_OVERLAY=./assets/hand_overlay.mov
+# ✅ no COPY assets
+# ✅ no LOCAL_OVERLAY
+ENV OVERLAY_URL=""
 
 COPY app.py ./
 
-# env defaults (overridden in Render)
 ENV S3_BUCKET=""
 ENV S3_PREFIX="renders/"
 ENV PUBLIC_BASE_URL=""
