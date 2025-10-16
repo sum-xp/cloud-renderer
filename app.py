@@ -116,8 +116,12 @@ def run_ffmpeg(base_mp4: str, overlay_mov: str, out_mp4: str) -> None:
         "-i", base_mp4, "-i", overlay_mov,
         "-filter_complex", filtergraph,
         "-map", "[v]", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",     # was veryfast
+        "-crf", "23",               # was 20
+        "-threads", "1",            # keep CPU predictable on Starter
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
         out_mp4
     ]
     subprocess.check_call(cmd)
