@@ -1,3 +1,4 @@
-requests
-boto3
-imageio-ffmpeg
+Flask>=3.0
+gunicorn>=21.2
+requests>=2.31
+boto3>=1.34
